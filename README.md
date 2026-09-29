@@ -25,11 +25,12 @@ dict flash
 # Look up multiple words
 dict pathos fustian sport
 
-# No flags needed — etymology, quotes, and synonyms are shown by default
+# No flags needed — etymology, quotes, synonyms, and rhymes are shown by default
 # Suppress them individually:
 dict --no-etymology flash
 dict --no-quotes flash
 dict --no-synonyms flash
+dict --no-rhymes flash
 
 # Re-download and re-index the dictionary
 dict --refresh

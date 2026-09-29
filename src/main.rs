@@ -5,6 +5,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::{params, Connection};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -33,6 +34,10 @@ struct Cli {
     /// Show synonyms and related words
     #[arg(short, long, default_value_t = true)]
     synonyms: bool,
+
+    /// Show rhymes (via Prosodic)
+    #[arg(short = 'r', long = "rhymes", default_value_t = true)]
+    rhymes: bool,
 
     /// Re-download and re-index the dictionary
     #[arg(long)]
@@ -97,7 +102,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
             entry_id    INTEGER NOT NULL REFERENCES entries(id),
             text        TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_entries_word ON entries(word);",
+        CREATE TABLE IF NOT EXISTS word_rimes (
+            word        TEXT PRIMARY KEY,
+            rime        TEXT NOT NULL,
+            num_sylls   INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_entries_word ON entries(word);
+        CREATE INDEX IF NOT EXISTS idx_word_rimes_rime ON word_rimes(rime, num_sylls);",
     )?;
     Ok(())
 }
@@ -241,7 +252,7 @@ fn commit_entry(
     }
 
     *count += 1;
-    if *count % 1000 == 0 {
+    if (*count).is_multiple_of(1000) {
         pb.set_message(format!("Indexed {count} entries…"));
     }
     Ok(())
@@ -250,7 +261,7 @@ fn commit_entry(
 /// Extract the text content of a specific XML element from a paragraph chunk,
 /// handling nested tags by collecting all text nodes within.
 /// Returns the joined inner text of the first matching element.
-fn extract_tag<'a>(paragraph: &'a str, tag: &str) -> Option<String> {
+fn extract_tag(paragraph: &str, tag: &str) -> Option<String> {
     // Simple scan: find <tag> … </tag> and collect text within.
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
@@ -334,7 +345,7 @@ fn parse_and_insert(conn: &Connection, xml_data: &[u8], pb: &ProgressBar) -> Res
             }
             // Extract headword (first hw tag)
             if let Some(hw) = extract_tag(para, "hw") {
-                let cleaned = hw.replace('"', "").replace('*', "").replace('`', "");
+                let cleaned = hw.replace(['"', '*', '`'], "");
                 builder.headword = Some(cleaned.trim().to_string());
             }
             // Extract pronunciation (first pr, skip the vmorph/conjugation ones)
@@ -564,7 +575,7 @@ fn build_database(db_path: &Path) -> Result<()> {
 
         let letter = xml_name
             .split('_')
-            .last()
+            .next_back()
             .and_then(|s| s.strip_suffix(".xml"))
             .unwrap_or("?");
 
@@ -581,6 +592,9 @@ fn build_database(db_path: &Path) -> Result<()> {
         "INSERT OR REPLACE INTO meta(key, value) VALUES ('version', ?1)",
         params![DB_VERSION.to_string()],
     )?;
+
+    // Pre-build phonetic rhymes index via Prosodic if available
+    let _ = build_rhymes_index(db_path);
 
     pb.finish_with_message(format!(
         "✓ Dictionary ready — {} entries indexed",
@@ -688,6 +702,183 @@ fn get_synonyms(conn: &Connection, entry_id: i64) -> Result<Vec<String>> {
     Ok(rows)
 }
 
+/// Candidate word with its edit distance and Jaro-Winkler score.
+#[derive(Debug)]
+struct FuzzyMatch {
+    word: String,
+    dist: usize,
+    jw: f64,
+}
+
+/// Load all unique dictionary words and find the closest matches to `query`.
+/// Returns up to `limit` matches, sorted by (edit_distance, -jaro_winkler).
+fn fuzzy_lookup(conn: &Connection, query: &str, limit: usize) -> Result<Vec<FuzzyMatch>> {
+    let q = query.to_lowercase();
+
+    // Load all unique indexed words (they're short ASCII strings, this is fast)
+    let mut stmt = conn.prepare("SELECT DISTINCT word FROM entries")?;
+    let words: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Score every word
+    let mut scored: Vec<FuzzyMatch> = words
+        .into_iter()
+        .map(|w| {
+            let dist = strsim::levenshtein(&q, &w);
+            let jw = strsim::jaro_winkler(&q, &w);
+            FuzzyMatch { word: w, dist, jw }
+        })
+        .collect();
+
+    // Sort: primary = edit distance, secondary = jaro-winkler descending
+    scored.sort_by(|a, b| a.dist.cmp(&b.dist).then(b.jw.partial_cmp(&a.jw).unwrap()));
+
+    scored.truncate(limit);
+    Ok(scored)
+}
+
+/// Helper to locate Python binary and prosodic_rhymes.py script.
+fn prosodic_tools() -> Option<(PathBuf, PathBuf)> {
+    let python_candidates = [
+        PathBuf::from(".venv/bin/python"),
+        PathBuf::from("/home/vega/Documents/git/local/good-dict-rs/.venv/bin/python"),
+    ];
+    let python_bin = python_candidates.into_iter().find(|p| p.exists())?;
+
+    let script_candidates = [
+        PathBuf::from("prosodic_rhymes.py"),
+        PathBuf::from("/home/vega/Documents/git/local/good-dict-rs/prosodic_rhymes.py"),
+    ];
+    let script_path = script_candidates.into_iter().find(|p| p.exists())?;
+
+    Some((python_bin, script_path))
+}
+
+/// Pre-populate the SQLite word_rimes table using Prosodic in ~1 second.
+fn build_rhymes_index(db_path: &Path) -> Result<()> {
+    if let Some((python_bin, script_path)) = prosodic_tools() {
+        let status = Command::new(python_bin)
+            .arg(script_path)
+            .arg("--build-index")
+            .arg(db_path)
+            .status();
+        if let Ok(st) = status {
+            if st.success() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Query Prosodic to calculate the rime for an out-of-vocabulary word, caching it in SQLite.
+fn fetch_rime_from_prosodic(word: &str, db_path: &Path) -> Option<(String, i64)> {
+    let (python_bin, script_path) = prosodic_tools()?;
+    let output = Command::new(python_bin)
+        .arg(script_path)
+        .arg("--get-rime")
+        .arg(word)
+        .arg(db_path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let val: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let rime = val.get("rime")?.as_str()?.to_string();
+    let num_sylls = val.get("num_sylls")?.as_i64()?;
+    Some((rime, num_sylls))
+}
+
+/// Ensure word_rimes is populated if Prosodic is installed.
+fn ensure_rhymes_indexed(conn: &Connection, db_path: &Path) {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM word_rimes", [], |r| r.get(0))
+        .unwrap_or(0);
+    if count == 0 {
+        let _ = build_rhymes_index(db_path);
+    }
+}
+
+/// Look up rhymes for a word instantly (<1ms) from the SQLite pre-generated index.
+/// We invoke the Python helper strictly as a subprocess (either for initial index generation
+/// or for OOV words), keeping the Rust binary completely unencumbered by GPL code.
+fn lookup_rhymes(conn: &Connection, db_path: &Path, word: &str, limit: usize) -> Vec<String> {
+    ensure_rhymes_indexed(conn, db_path);
+
+    let w = word.to_lowercase();
+    let rime_info: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT rime, num_sylls FROM word_rimes WHERE word = ?1",
+            params![w],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let (rime, num_sylls) = match rime_info {
+        Some((r, n)) => (r, n),
+        None => {
+            if let Some((r, n)) = fetch_rime_from_prosodic(&w, db_path) {
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO word_rimes (word, rime, num_sylls) VALUES (?1, ?2, ?3)",
+                    params![w, r, n],
+                );
+                (r, n)
+            } else {
+                return Vec::new();
+            }
+        }
+    };
+
+    // 1. Query matching rhymes from SQLite, joined with entries so we return genuine dictionary words
+    let mut stmt = match conn.prepare(
+        "SELECT DISTINCT r.word
+         FROM word_rimes r
+         JOIN entries e ON e.word = r.word
+         WHERE r.rime = ?1 AND r.word != ?2
+         ORDER BY ABS(r.num_sylls - ?3), length(r.word), r.word
+         LIMIT ?4",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut results: Vec<String> = stmt
+        .query_map(params![rime, w, num_sylls, limit as i64], |row| row.get(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+
+    // 2. If entries had fewer than limit results, pull remainder from word_rimes directly
+    if results.len() < limit {
+        if let Ok(mut stmt_all) = conn.prepare(
+            "SELECT word
+             FROM word_rimes
+             WHERE rime = ?1 AND word != ?2
+             ORDER BY ABS(num_sylls - ?3), length(word), word
+             LIMIT ?4",
+        ) {
+            if let Ok(rows) =
+                stmt_all.query_map(params![rime, w, num_sylls, limit as i64], |row| row.get(0))
+            {
+                for r in rows.flatten() {
+                    if !results.contains(&r) {
+                        results.push(r);
+                    }
+                    if results.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
 // ── Display ──────────────────────────────────────────────────────────────────
 
 /// Wrap text at a given column width (respecting word boundaries).
@@ -727,6 +918,7 @@ fn display_entries(
     show_ety: bool,
     show_quotes: bool,
     show_syns: bool,
+    rhymes: &[String],
 ) {
     let width = term_width();
     let rule: String = "─".repeat(width);
@@ -804,62 +996,103 @@ fn display_entries(
 
         // ── Synonyms & Usage ────────────────────────────────────────────────
         if show_syns && !syns.is_empty() {
-            // First element: try to extract the concise synonym list (e.g. "Syn. -- Flash, Glitter, Gleam")
-            // Second+ elements may be full usage prose
             let mut syn_words: Vec<String> = Vec::new();
+            let mut see_refs: Vec<String> = Vec::new();
             let mut usage_notes: Vec<String> = Vec::new();
 
-            for raw in syns.iter().take(3) {
+            for raw in syns.iter() {
                 let t = strip_tags(raw);
-                if t.is_empty() {
+                let trimmed = t.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
-                // If it starts with "Syn." extract the word list up to the first period/sentence
-                if t.starts_with("Syn.") || t.starts_with("Syn --") {
-                    // Grab words between -- and first .
-                    let after_dash = t.find("--").map(|i| &t[i + 2..]).unwrap_or(&t);
-                    // Take until the period that ends the list
-                    let words_part = after_dash.split('.').next().unwrap_or(after_dash);
-                    let words: Vec<&str> = words_part
-                        .split(',')
-                        .map(|w| w.trim())
-                        .filter(|w| {
-                            !w.is_empty() && !w.contains(' ').then_some(true).unwrap_or(false)
-                        })
-                        .collect();
-                    if words.len() > 1 {
-                        syn_words.extend(words.iter().map(|w| w.to_string()));
+
+                // Check if this is a synonym list (starts with "Syn." or "Syn --" etc.)
+                let is_syn_header = trimmed.starts_with("Syn.")
+                    || trimmed.starts_with("Syn --")
+                    || trimmed.starts_with("Syn:");
+
+                if is_syn_header {
+                    let after_dash = if let Some(idx) = trimmed.find("--") {
+                        trimmed[idx + 2..].trim()
+                    } else if let Some(idx) = trimmed.find(':') {
+                        trimmed[idx + 1..].trim()
+                    } else {
+                        trimmed.strip_prefix("Syn.").unwrap_or(trimmed).trim()
+                    };
+
+                    // Extract any "See <Target>." cross reference
+                    let mut content = after_dash;
+                    if let Some(see_idx) = content.find("See ") {
+                        let ref_str = content[see_idx..].trim().trim_end_matches('.');
+                        if !see_refs.iter().any(|r| r == ref_str) {
+                            see_refs.push(ref_str.to_string());
+                        }
+                        content = content[..see_idx].trim();
                     }
-                    // The rest (after first sentence) is usage prose
-                    let usage: String = after_dash
-                        .splitn(2, '.')
-                        .nth(1)
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    if usage.len() > 20 {
-                        usage_notes.push(usage);
+
+                    // Semicolons or commas can separate words in the list
+                    // A period may separate list from subsequent usage text
+                    let words_part = content.split('.').next().unwrap_or(content);
+                    for item in words_part.split([';', ',']) {
+                        let word = item.trim().trim_end_matches('.');
+                        if !word.is_empty()
+                            && !word.to_lowercase().starts_with("see")
+                            && !syn_words.iter().any(|w| w.eq_ignore_ascii_case(word))
+                        {
+                            syn_words.push(word.to_string());
+                        }
+                    }
+
+                    // Any remaining text after the first period is usage text
+                    if let Some(idx) = content.find('.') {
+                        let remaining = content[idx + 1..].trim();
+                        if remaining.len() > 15 {
+                            usage_notes.push(remaining.to_string());
+                        }
                     }
                 } else {
-                    // Just usage prose
-                    usage_notes.push(t);
+                    // Usage prose or notes
+                    usage_notes.push(trimmed.to_string());
                 }
             }
 
-            if !syn_words.is_empty() || !usage_notes.is_empty() {
+            if !syn_words.is_empty() || !usage_notes.is_empty() || !see_refs.is_empty() {
                 println!();
             }
+
             if !syn_words.is_empty() {
-                println!(
+                let mut line = format!(
                     "  {} {}",
                     "Synonyms:".bold().bright_magenta(),
                     syn_words.join("  ·  ").bright_black()
                 );
+                if !see_refs.is_empty() {
+                    line.push_str(&format!("  {}", see_refs.join(", ").dimmed()));
+                }
+                println!("{}", line);
+            } else if !see_refs.is_empty() {
+                println!(
+                    "  {} {}",
+                    "Synonyms:".bold().bright_magenta(),
+                    see_refs.join(", ").dimmed()
+                );
             }
-            for note in usage_notes.iter().take(1) {
+
+            for note in usage_notes.iter().take(2) {
                 println!("{}", wrap(note, width, "  ").bright_black().italic());
             }
         }
+    }
+
+    // ── Rhymes (via Prosodic) ────────────────────────────────────────────────
+    if !rhymes.is_empty() {
+        println!();
+        println!(
+            "  {} {}",
+            "Rhymes:".bold().bright_blue(),
+            rhymes.join("  ·  ").bright_black()
+        );
     }
 
     println!();
@@ -890,17 +1123,59 @@ fn main() -> Result<()> {
         let entries = lookup(&conn, word)?;
 
         if entries.is_empty() {
-            // Try case-insensitive partial match for suggestions
-            let mut stmt =
-                conn.prepare("SELECT DISTINCT word FROM entries WHERE word LIKE ?1 LIMIT 8")?;
-            let suggestions: Vec<String> = stmt
-                .query_map(params![format!("{word}%")], |r| r.get(0))?
-                .filter_map(|r| r.ok())
-                .collect();
+            let candidates = fuzzy_lookup(&conn, word, 6)?;
+            let best = candidates.first();
 
-            eprintln!("{} {}", "Not found:".bold().red(), word.bright_white());
-            if !suggestions.is_empty() {
-                eprintln!("  Did you mean: {}", suggestions.join(", ").bright_black());
+            // Auto-correct if the closest match is within 2 edits
+            if best.is_some_and(|m| m.dist <= 2) {
+                let best = best.unwrap();
+                eprintln!(
+                    "  {} {} → {}",
+                    "~".bright_yellow(),
+                    word.bright_black(),
+                    best.word.bold()
+                );
+                // Re-run lookup with the corrected word
+                let corrected = lookup(&conn, &best.word)?;
+                let mut display_data = Vec::new();
+                for entry in corrected {
+                    let senses = get_senses(&conn, entry.id)?;
+                    let quotes = if cli.quotes {
+                        get_quotes(&conn, entry.id)?
+                    } else {
+                        vec![]
+                    };
+                    let syns = if cli.synonyms {
+                        get_synonyms(&conn, entry.id)?
+                    } else {
+                        vec![]
+                    };
+                    display_data.push((entry, senses, quotes, syns));
+                }
+                let rhymes = if cli.rhymes {
+                    lookup_rhymes(&conn, &db_path, &best.word, 12)
+                } else {
+                    Vec::new()
+                };
+                display_entries(
+                    &display_data,
+                    cli.etymology,
+                    cli.quotes,
+                    cli.synonyms,
+                    &rhymes,
+                );
+            } else {
+                // Show ranked suggestions (dist 3-4 range)
+                let suggestions: Vec<&str> = candidates
+                    .iter()
+                    .filter(|m| m.dist <= 4)
+                    .take(5)
+                    .map(|m| m.word.as_str())
+                    .collect();
+                eprintln!("{} {}", "Not found:".bold().red(), word.bright_white());
+                if !suggestions.is_empty() {
+                    eprintln!("  Did you mean: {}", suggestions.join(", ").bright_black());
+                }
             }
             continue;
         }
@@ -923,7 +1198,18 @@ fn main() -> Result<()> {
             display_data.push((entry, senses, quotes, syns));
         }
 
-        display_entries(&display_data, cli.etymology, cli.quotes, cli.synonyms);
+        let rhymes = if cli.rhymes {
+            lookup_rhymes(&conn, &db_path, word, 12)
+        } else {
+            Vec::new()
+        };
+        display_entries(
+            &display_data,
+            cli.etymology,
+            cli.quotes,
+            cli.synonyms,
+            &rhymes,
+        );
     }
 
     Ok(())
