@@ -50,6 +50,15 @@ def word_rime_from_ipa(ipa: str):
     return parse_syll_rime(last_syll), num_sylls
 
 
+def split_rime(rime: str) -> tuple[str, str]:
+    """Split a rime string into (nucleus, coda)."""
+    phones = prosodic.words.syllables._parse_ipa_cached(rime)
+    i = 0
+    while i < len(phones) and phones[i] in VOWELS:
+        i += 1
+    return "".join(phones[:i]), "".join(phones[i:])
+
+
 def get_default_db_path() -> str:
     return os.path.expanduser("~/.local/share/good-dict/webster1913.db")
 
@@ -67,10 +76,14 @@ def build_index(db_path: str = None) -> int:
     CREATE TABLE IF NOT EXISTS word_rimes (
         word TEXT PRIMARY KEY,
         rime TEXT NOT NULL,
+        nucleus TEXT NOT NULL,
+        coda TEXT NOT NULL,
         num_sylls INTEGER NOT NULL
     )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_word_rimes_rime ON word_rimes(rime, num_sylls)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_word_rimes_coda ON word_rimes(coda, num_sylls)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_word_rimes_nuc ON word_rimes(nucleus, num_sylls)")
 
     lang = prosodic.Language("en")
     tsv_path = lang.path_token2ipa
@@ -88,9 +101,10 @@ def build_index(db_path: str = None) -> int:
                 ipa = parts[1]
                 rime, num_sylls = word_rime_from_ipa(ipa)
                 if rime:
-                    rows.append((w, rime, num_sylls))
+                    nuc, coda = split_rime(rime)
+                    rows.append((w, rime, nuc, coda, num_sylls))
 
-    cur.executemany("INSERT OR REPLACE INTO word_rimes VALUES (?, ?, ?)", rows)
+    cur.executemany("INSERT OR REPLACE INTO word_rimes VALUES (?, ?, ?, ?, ?)", rows)
     conn.commit()
     count = len(rows)
     conn.close()
@@ -98,7 +112,7 @@ def build_index(db_path: str = None) -> int:
 
 
 def get_word_rime(word_str: str, db_path: str = None):
-    """Get the rime and syllable count for a single word, caching in DB if available."""
+    """Get the rime, nucleus, coda, and syllable count for a single word, caching in DB if available."""
     word_lower = word_str.lower().strip()
     if not db_path:
         db_path = get_default_db_path()
@@ -108,11 +122,17 @@ def get_word_rime(word_str: str, db_path: str = None):
         try:
             conn = sqlite3.connect(db_path)
             cur = conn.cursor()
-            cur.execute("SELECT rime, num_sylls FROM word_rimes WHERE word = ?", (word_lower,))
+            cur.execute("SELECT rime, nucleus, coda, num_sylls FROM word_rimes WHERE word = ?", (word_lower,))
             row = cur.fetchone()
             conn.close()
             if row:
-                return {"word": word_lower, "rime": row[0], "num_sylls": row[1]}
+                return {
+                    "word": word_lower,
+                    "rime": row[0],
+                    "nucleus": row[1],
+                    "coda": row[2],
+                    "num_sylls": row[3],
+                }
         except Exception:
             pass
 
@@ -123,6 +143,7 @@ def get_word_rime(word_str: str, db_path: str = None):
     wf = pw.children[0]
     rime = wf.rime.txt
     num_sylls = wf.num_sylls
+    nuc, coda = split_rime(rime)
 
     # Save to DB cache if DB exists
     if os.path.exists(db_path) and rime:
@@ -130,15 +151,58 @@ def get_word_rime(word_str: str, db_path: str = None):
             conn = sqlite3.connect(db_path)
             cur = conn.cursor()
             cur.execute(
-                "INSERT OR REPLACE INTO word_rimes (word, rime, num_sylls) VALUES (?, ?, ?)",
-                (word_lower, rime, num_sylls),
+                "INSERT OR REPLACE INTO word_rimes (word, rime, nucleus, coda, num_sylls) VALUES (?, ?, ?, ?, ?)",
+                (word_lower, rime, nuc, coda, num_sylls),
             )
             conn.commit()
             conn.close()
         except Exception:
             pass
 
-    return {"word": word_lower, "rime": rime, "num_sylls": num_sylls}
+    return {
+        "word": word_lower,
+        "rime": rime,
+        "nucleus": nuc,
+        "coda": coda,
+        "num_sylls": num_sylls,
+    }
+
+
+def get_similar_codas(coda: str) -> list[str]:
+    """Phonetically related codas for assonance matching."""
+    res = set()
+    substitutions = [
+        ("t", "d"), ("d", "t"),
+        ("s", "z"), ("z", "s"),
+        ("p", "b"), ("b", "p"),
+        ("k", "ɡ"), ("ɡ", "k"),
+        ("f", "v"), ("v", "f"),
+        ("ʃ", "ʧ"), ("ʧ", "ʃ"),
+        ("ʃ", "s"), ("s", "ʃ"),
+        ("ʃ", "st"), ("ʃ", "sp"),
+        ("nʧən", "nʃən"), ("nʃən", "nʧən"),
+        ("ʧən", "ʃən"), ("ʃən", "ʧən"),
+        ("m", "n"), ("n", "m"), ("n", "ŋ"), ("ŋ", "n"),
+        ("m", "nd"), ("m", "nt"),
+        ("rt", "rd"), ("rd", "rt"), ("rt", "rn"), ("rd", "rn"),
+        ("st", "s"), ("s", "st"),
+        ("nd", "nt"), ("nt", "nd"), ("nd", "n"), ("nt", "n"),
+        ("ld", "lt"), ("lt", "ld"), ("ld", "l"),
+        ("mp", "m"), ("mb", "m"),
+        ("ʤɪk", "tɪk"), ("ʤɪk", "sɪk"), ("ʤɪk", "k"),
+    ]
+    for src, dst in substitutions:
+        if coda.endswith(src):
+            res.add(coda[:-len(src)] + dst)
+        if src in coda:
+            res.add(coda.replace(src, dst))
+
+    if coda.endswith("s") or coda.endswith("z") or coda.endswith("d") or coda.endswith("t"):
+        res.add(coda[:-1])
+
+    res.discard(coda)
+    res.discard("")
+    return sorted(res)
 
 
 def main():

@@ -25,12 +25,13 @@ dict flash
 # Look up multiple words
 dict pathos fustian sport
 
-# No flags needed — etymology, quotes, synonyms, and rhymes are shown by default
+# No flags needed — etymology, quotes, synonyms, rhymes, and near rhymes are shown by default
 # Suppress them individually:
 dict --no-etymology flash
 dict --no-quotes flash
 dict --no-synonyms flash
 dict --no-rhymes flash
+dict --no-near-rhymes flash
 
 # Re-download and re-index the dictionary
 dict --refresh
@@ -52,6 +53,9 @@ flash  (flăsh)  v.i.
           — Tennyson.
 
   Synonyms:  gleam | glitter | glisten
+
+  Rhymes: ash  ·  bash  ·  cash  ·  dash  ·  gash  ·  hash  ·  lash  ·  mash  ·  rash
+  Near rhymes: asp  ·  bish  ·  ass  ·  bosh  ·  gas  ·  bush  ·  dish  ·  bass  ·  fish
 ```
 
 ## The Dictionary

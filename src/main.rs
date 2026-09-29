@@ -26,22 +26,54 @@ struct Cli {
     /// Show etymology
     #[arg(short, long, default_value_t = true)]
     etymology: bool,
+    #[arg(long = "no-etymology", help = "Do not show etymology")]
+    no_etymology: bool,
 
     /// Show example quotations
     #[arg(short = 'q', long = "quotes", default_value_t = true)]
     quotes: bool,
+    #[arg(long = "no-quotes", help = "Do not show example quotations")]
+    no_quotes: bool,
 
     /// Show synonyms and related words
     #[arg(short, long, default_value_t = true)]
     synonyms: bool,
+    #[arg(long = "no-synonyms", help = "Do not show synonyms")]
+    no_synonyms: bool,
 
     /// Show rhymes (via Prosodic)
     #[arg(short = 'r', long = "rhymes", default_value_t = true)]
     rhymes: bool,
+    #[arg(long = "no-rhymes", help = "Do not show rhymes")]
+    no_rhymes: bool,
+
+    /// Show near rhymes / slant rhymes (via Prosodic)
+    #[arg(short = 'n', long = "near-rhymes", default_value_t = true)]
+    near_rhymes: bool,
+    #[arg(long = "no-near-rhymes", help = "Do not show near rhymes")]
+    no_near_rhymes: bool,
 
     /// Re-download and re-index the dictionary
     #[arg(long)]
     refresh: bool,
+}
+
+impl Cli {
+    fn show_etymology(&self) -> bool {
+        self.etymology && !self.no_etymology
+    }
+    fn show_quotes(&self) -> bool {
+        self.quotes && !self.no_quotes
+    }
+    fn show_synonyms(&self) -> bool {
+        self.synonyms && !self.no_synonyms
+    }
+    fn show_rhymes(&self) -> bool {
+        self.rhymes && !self.no_rhymes
+    }
+    fn show_near_rhymes(&self) -> bool {
+        self.near_rhymes && !self.no_near_rhymes
+    }
 }
 
 // ── Database ─────────────────────────────────────────────────────────────────
@@ -105,10 +137,14 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS word_rimes (
             word        TEXT PRIMARY KEY,
             rime        TEXT NOT NULL,
+            nucleus     TEXT NOT NULL,
+            coda        TEXT NOT NULL,
             num_sylls   INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_entries_word ON entries(word);
-        CREATE INDEX IF NOT EXISTS idx_word_rimes_rime ON word_rimes(rime, num_sylls);",
+        CREATE INDEX IF NOT EXISTS idx_word_rimes_rime ON word_rimes(rime, num_sylls);
+        CREATE INDEX IF NOT EXISTS idx_word_rimes_coda ON word_rimes(coda, num_sylls);
+        CREATE INDEX IF NOT EXISTS idx_word_rimes_nuc ON word_rimes(nucleus, num_sylls);",
     )?;
     Ok(())
 }
@@ -773,8 +809,8 @@ fn build_rhymes_index(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Query Prosodic to calculate the rime for an out-of-vocabulary word, caching it in SQLite.
-fn fetch_rime_from_prosodic(word: &str, db_path: &Path) -> Option<(String, i64)> {
+/// Query Prosodic to calculate the rime, nucleus, and coda for an out-of-vocabulary word, caching it in SQLite.
+fn fetch_rime_from_prosodic(word: &str, db_path: &Path) -> Option<(String, String, String, i64)> {
     let (python_bin, script_path) = prosodic_tools()?;
     let output = Command::new(python_bin)
         .arg(script_path)
@@ -790,8 +826,10 @@ fn fetch_rime_from_prosodic(word: &str, db_path: &Path) -> Option<(String, i64)>
 
     let val: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
     let rime = val.get("rime")?.as_str()?.to_string();
+    let nucleus = val.get("nucleus")?.as_str()?.to_string();
+    let coda = val.get("coda")?.as_str()?.to_string();
     let num_sylls = val.get("num_sylls")?.as_i64()?;
-    Some((rime, num_sylls))
+    Some((rime, nucleus, coda, num_sylls))
 }
 
 /// Ensure word_rimes is populated if Prosodic is installed.
@@ -804,79 +842,232 @@ fn ensure_rhymes_indexed(conn: &Connection, db_path: &Path) {
     }
 }
 
-/// Look up rhymes for a word instantly (<1ms) from the SQLite pre-generated index.
+/// Generate phonetically close coda variants for assonance matching (like RhymeZone).
+fn get_similar_codas(coda: &str) -> Vec<String> {
+    let mut res = Vec::new();
+    let substitutions = [
+        ("t", "d"), ("d", "t"),
+        ("s", "z"), ("z", "s"),
+        ("p", "b"), ("b", "p"),
+        ("k", "ɡ"), ("ɡ", "k"),
+        ("f", "v"), ("v", "f"),
+        ("ʃ", "ʧ"), ("ʧ", "ʃ"),
+        ("ʃ", "s"), ("s", "ʃ"),
+        ("ʃ", "st"), ("ʃ", "sp"),
+        ("nʧən", "nʃən"), ("nʃən", "nʧən"),
+        ("ʧən", "ʃən"), ("ʃən", "ʧən"),
+        ("m", "n"), ("n", "m"), ("n", "ŋ"), ("ŋ", "n"),
+        ("m", "nd"), ("m", "nt"),
+        ("rt", "rd"), ("rd", "rt"), ("rt", "rn"), ("rd", "rn"),
+        ("st", "s"), ("s", "st"),
+        ("nd", "nt"), ("nt", "nd"), ("nd", "n"), ("nt", "n"),
+        ("ld", "lt"), ("lt", "ld"), ("ld", "l"),
+        ("mp", "m"), ("mb", "m"),
+        ("ʤɪk", "tɪk"), ("ʤɪk", "sɪk"), ("ʤɪk", "k"),
+    ];
+    for (src, dst) in substitutions {
+        if let Some(prefix) = coda.strip_suffix(src) {
+            res.push(format!("{prefix}{dst}"));
+        }
+        if coda.contains(src) {
+            res.push(coda.replace(src, dst));
+        }
+    }
+    if (coda.ends_with('s') || coda.ends_with('z') || coda.ends_with('d') || coda.ends_with('t'))
+        && coda.len() > 1
+    {
+        res.push(coda[..coda.len() - 1].to_string());
+    }
+    res.retain(|c| c != coda && !c.is_empty());
+    res.sort();
+    res.dedup();
+    res
+}
+
+#[derive(Default, Debug)]
+struct RhymeResults {
+    perfect: Vec<String>,
+    near: Vec<String>,
+}
+
+/// Look up rhymes and near-rhymes instantly (<1ms) from the SQLite pre-generated index.
 /// We invoke the Python helper strictly as a subprocess (either for initial index generation
 /// or for OOV words), keeping the Rust binary completely unencumbered by GPL code.
-fn lookup_rhymes(conn: &Connection, db_path: &Path, word: &str, limit: usize) -> Vec<String> {
+fn lookup_rhymes(
+    conn: &Connection,
+    db_path: &Path,
+    word: &str,
+    perfect_limit: usize,
+    near_limit: usize,
+) -> RhymeResults {
     ensure_rhymes_indexed(conn, db_path);
 
     let w = word.to_lowercase();
-    let rime_info: Option<(String, i64)> = conn
+    let rime_info: Option<(String, String, String, i64)> = conn
         .query_row(
-            "SELECT rime, num_sylls FROM word_rimes WHERE word = ?1",
+            "SELECT rime, nucleus, coda, num_sylls FROM word_rimes WHERE word = ?1",
             params![w],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .ok();
 
-    let (rime, num_sylls) = match rime_info {
-        Some((r, n)) => (r, n),
+    let (rime, nucleus, coda, num_sylls) = match rime_info {
+        Some(info) => info,
         None => {
-            if let Some((r, n)) = fetch_rime_from_prosodic(&w, db_path) {
+            if let Some((r, nuc, cd, n)) = fetch_rime_from_prosodic(&w, db_path) {
                 let _ = conn.execute(
-                    "INSERT OR REPLACE INTO word_rimes (word, rime, num_sylls) VALUES (?1, ?2, ?3)",
-                    params![w, r, n],
+                    "INSERT OR REPLACE INTO word_rimes (word, rime, nucleus, coda, num_sylls) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![w, r, nuc, cd, n],
                 );
-                (r, n)
+                (r, nuc, cd, n)
             } else {
-                return Vec::new();
+                return RhymeResults::default();
             }
         }
     };
 
-    // 1. Query matching rhymes from SQLite, joined with entries so we return genuine dictionary words
-    let mut stmt = match conn.prepare(
-        "SELECT DISTINCT r.word
-         FROM word_rimes r
-         JOIN entries e ON e.word = r.word
-         WHERE r.rime = ?1 AND r.word != ?2
-         ORDER BY ABS(r.num_sylls - ?3), length(r.word), r.word
-         LIMIT ?4",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
+    // 1. Perfect rhymes
+    let perfect = if perfect_limit > 0 {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT r.word
+                 FROM word_rimes r
+                 JOIN entries e ON e.word = r.word
+                 WHERE r.rime = ?1 AND r.word != ?2
+                 ORDER BY ABS(r.num_sylls - ?3), length(r.word), r.word
+                 LIMIT ?4",
+            )
+            .ok();
 
-    let mut results: Vec<String> = stmt
-        .query_map(params![rime, w, num_sylls, limit as i64], |row| row.get(0))
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
+        let mut res: Vec<String> = stmt
+            .as_mut()
+            .and_then(|s| {
+                s.query_map(params![rime, w, num_sylls, perfect_limit as i64], |row| {
+                    row.get(0)
+                })
+                .ok()
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
 
-    // 2. If entries had fewer than limit results, pull remainder from word_rimes directly
-    if results.len() < limit {
-        if let Ok(mut stmt_all) = conn.prepare(
-            "SELECT word
-             FROM word_rimes
-             WHERE rime = ?1 AND word != ?2
-             ORDER BY ABS(num_sylls - ?3), length(word), word
-             LIMIT ?4",
-        ) {
-            if let Ok(rows) =
-                stmt_all.query_map(params![rime, w, num_sylls, limit as i64], |row| row.get(0))
-            {
-                for r in rows.flatten() {
-                    if !results.contains(&r) {
-                        results.push(r);
-                    }
-                    if results.len() >= limit {
-                        break;
+        if res.len() < perfect_limit {
+            if let Ok(mut stmt_all) = conn.prepare(
+                "SELECT word
+                 FROM word_rimes
+                 WHERE rime = ?1 AND word != ?2
+                 ORDER BY ABS(num_sylls - ?3), length(word), word
+                 LIMIT ?4",
+            ) {
+                if let Ok(rows) = stmt_all.query_map(
+                    params![rime, w, num_sylls, perfect_limit as i64],
+                    |row| row.get(0),
+                ) {
+                    for r in rows.flatten() {
+                        if !res.contains(&r) {
+                            res.push(r);
+                        }
+                        if res.len() >= perfect_limit {
+                            break;
+                        }
                     }
                 }
             }
         }
-    }
+        res
+    } else {
+        Vec::new()
+    };
 
-    results
+    // 2. Near rhymes (RhymeZone style: Slant consonance + Assonance)
+    let near = if near_limit > 0 {
+        let mut slants = Vec::new();
+        let mut assonance = Vec::new();
+
+        // (a) Slant rhymes: exact coda consonant identity, different vowel nucleus
+        let slant_query_limit = (near_limit / 2 + 2) as i64;
+        if let Ok(mut stmt_slant) = conn.prepare(
+            "SELECT DISTINCT r.word
+             FROM word_rimes r
+             JOIN entries e ON e.word = r.word
+             WHERE r.coda = ?1 AND r.rime != ?2 AND r.word != ?3 AND length(r.word) >= 3
+             ORDER BY ABS(r.num_sylls - ?4), length(r.word), r.word
+             LIMIT ?5",
+        ) {
+            if let Ok(rows) = stmt_slant.query_map(
+                params![coda, rime, w, num_sylls, slant_query_limit],
+                |row| row.get(0),
+            ) {
+                for r in rows.flatten() {
+                    if !perfect.contains(&r) && !slants.contains(&r) {
+                        slants.push(r);
+                    }
+                }
+            }
+        }
+
+        // (b) Assonance rhymes: exact vowel nucleus, phonetically similar coda
+        let close_c = get_similar_codas(&coda);
+        if !close_c.is_empty() {
+            let placeholders = close_c
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT DISTINCT r.word
+                 FROM word_rimes r
+                 JOIN entries e ON e.word = r.word
+                 WHERE r.nucleus = ? AND r.coda IN ({placeholders}) AND r.rime != ? AND r.word != ? AND length(r.word) >= 3
+                 ORDER BY ABS(r.num_sylls - ?), length(r.word), r.word
+                 LIMIT ?"
+            );
+            if let Ok(mut stmt_assonance) = conn.prepare(&sql) {
+                let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::new();
+                params_vec.push(&nucleus);
+                for c in &close_c {
+                    params_vec.push(c);
+                }
+                params_vec.push(&rime);
+                params_vec.push(&w);
+                params_vec.push(&num_sylls);
+                let assonance_limit = near_limit as i64;
+                params_vec.push(&assonance_limit);
+
+                if let Ok(rows) = stmt_assonance
+                    .query_map(params_vec.as_slice(), |row| row.get(0))
+                {
+                    for r in rows.flatten() {
+                        if !perfect.contains(&r) && !assonance.contains(&r) {
+                            assonance.push(r);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Interleave assonance and slant rhymes for balanced RhymeZone-like variety
+        let mut combined = Vec::new();
+        let max_len = slants.len().max(assonance.len());
+        for i in 0..max_len {
+            if let Some(a) = assonance.get(i) {
+                if !combined.contains(a) {
+                    combined.push(a.clone());
+                }
+            }
+            if let Some(s) = slants.get(i) {
+                if !combined.contains(s) {
+                    combined.push(s.clone());
+                }
+            }
+        }
+
+        combined.truncate(near_limit);
+        combined
+    } else {
+        Vec::new()
+    };
+
+    RhymeResults { perfect, near }
 }
 
 // ── Display ──────────────────────────────────────────────────────────────────
@@ -919,6 +1110,7 @@ fn display_entries(
     show_quotes: bool,
     show_syns: bool,
     rhymes: &[String],
+    near_rhymes: &[String],
 ) {
     let width = term_width();
     let rule: String = "─".repeat(width);
@@ -1094,6 +1286,16 @@ fn display_entries(
             rhymes.join("  ·  ").bright_black()
         );
     }
+    if !near_rhymes.is_empty() {
+        if rhymes.is_empty() {
+            println!();
+        }
+        println!(
+            "  {} {}",
+            "Near rhymes:".bold().bright_blue(),
+            near_rhymes.join("  ·  ").bright_black()
+        );
+    }
 
     println!();
 }
@@ -1114,6 +1316,12 @@ fn main() -> Result<()> {
     }
 
     let conn = open_db(&db_path)?;
+
+    let show_etymology = cli.show_etymology();
+    let show_quotes = cli.show_quotes();
+    let show_synonyms = cli.show_synonyms();
+    let show_rhymes = cli.show_rhymes();
+    let show_near_rhymes = cli.show_near_rhymes();
 
     for (word_idx, word) in cli.words.iter().enumerate() {
         if word_idx > 0 {
@@ -1140,29 +1348,32 @@ fn main() -> Result<()> {
                 let mut display_data = Vec::new();
                 for entry in corrected {
                     let senses = get_senses(&conn, entry.id)?;
-                    let quotes = if cli.quotes {
+                    let quotes = if show_quotes {
                         get_quotes(&conn, entry.id)?
                     } else {
                         vec![]
                     };
-                    let syns = if cli.synonyms {
+                    let syns = if show_synonyms {
                         get_synonyms(&conn, entry.id)?
                     } else {
                         vec![]
                     };
                     display_data.push((entry, senses, quotes, syns));
                 }
-                let rhymes = if cli.rhymes {
-                    lookup_rhymes(&conn, &db_path, &best.word, 12)
+                let rhyme_res = if show_rhymes || show_near_rhymes {
+                    let p_lim = if show_rhymes { 12 } else { 0 };
+                    let n_lim = if show_near_rhymes { 12 } else { 0 };
+                    lookup_rhymes(&conn, &db_path, &best.word, p_lim, n_lim)
                 } else {
-                    Vec::new()
+                    RhymeResults::default()
                 };
                 display_entries(
                     &display_data,
-                    cli.etymology,
-                    cli.quotes,
-                    cli.synonyms,
-                    &rhymes,
+                    show_etymology,
+                    show_quotes,
+                    show_synonyms,
+                    &rhyme_res.perfect,
+                    &rhyme_res.near,
                 );
             } else {
                 // Show ranked suggestions (dist 3-4 range)
@@ -1185,12 +1396,12 @@ fn main() -> Result<()> {
         // but we show all of them together for the same word
         for entry in entries {
             let senses = get_senses(&conn, entry.id)?;
-            let quotes = if cli.quotes {
+            let quotes = if show_quotes {
                 get_quotes(&conn, entry.id)?
             } else {
                 vec![]
             };
-            let syns = if cli.synonyms {
+            let syns = if show_synonyms {
                 get_synonyms(&conn, entry.id)?
             } else {
                 vec![]
@@ -1198,17 +1409,20 @@ fn main() -> Result<()> {
             display_data.push((entry, senses, quotes, syns));
         }
 
-        let rhymes = if cli.rhymes {
-            lookup_rhymes(&conn, &db_path, word, 12)
+        let rhyme_res = if show_rhymes || show_near_rhymes {
+            let p_lim = if show_rhymes { 12 } else { 0 };
+            let n_lim = if show_near_rhymes { 12 } else { 0 };
+            lookup_rhymes(&conn, &db_path, word, p_lim, n_lim)
         } else {
-            Vec::new()
+            RhymeResults::default()
         };
         display_entries(
             &display_data,
-            cli.etymology,
-            cli.quotes,
-            cli.synonyms,
-            &rhymes,
+            show_etymology,
+            show_quotes,
+            show_synonyms,
+            &rhyme_res.perfect,
+            &rhyme_res.near,
         );
     }
 
