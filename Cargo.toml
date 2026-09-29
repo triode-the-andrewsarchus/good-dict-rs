@@ -1,0 +1,39 @@
+[package]
+name = "good-dict"
+version = "0.1.0"
+edition = "2021"
+description = "Webster's 1913 dictionary CLI — the good dictionary"
+authors = []
+
+[[bin]]
+name = "dict"
+path = "src/main.rs"
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# HTTP downloads
+ureq = { version = "2", features = ["gzip"] }
+
+# XML parsing
+quick-xml = { version = "0.36", features = ["encoding"] }
+
+# SQLite for fast word lookup cache
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Zip extraction
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Terminal colors & formatting
+colored = "2"
+
+# Progress indicators
+indicatif = "0.17"
+
+# User data directories
+dirs = "5"
+
+# Error handling
+anyhow = "1"
+terminal_size = "0.4.4"
